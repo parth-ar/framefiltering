@@ -1,0 +1,31 @@
+# Virtual environments
+.venv/
+venv/
+vemv/
+ENV/
+env/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# PyTorch & YOLO model weights (auto-downloaded at runtime by scripts)
+*.pt
+*.onnx
+*.engine
+
+# Captured webcam frames and test dumps
+frames/
+test frames/annotated/
+
+# Local logs and runtime files
+*.log
+log.csv
+scored_log.csv
+
+# IDE & OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
