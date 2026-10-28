@@ -239,10 +239,11 @@ class AsyncDetector:
 
             t_start = time.time()
             try:
-                # 1. Run detection for General objects / Persons
+                # 1. Run detection ONLY for Persons (class 0) - ignores all other objects
                 res_obj = self.obj_model.predict(
                     source=frame_to_process,
                     imgsz=self.imgsz,
+                    classes=[0],
                     conf=conf,
                     verbose=False
                 )
@@ -255,14 +256,15 @@ class AsyncDetector:
                     verbose=False
                 )
 
-                # Parse object boxes
+                # Parse person boxes
                 parsed_obj = []
                 for b in res_obj[0].boxes:
-                    x1, y1, x2, y2 = map(int, b.xyxy[0])
-                    c = float(b.conf[0])
                     cid = int(b.cls[0])
-                    cname = self.obj_model.names[cid]
-                    parsed_obj.append((x1, y1, x2, y2, c, cid, cname))
+                    if cid == 0:  # Only person
+                        x1, y1, x2, y2 = map(int, b.xyxy[0])
+                        c = float(b.conf[0])
+                        cname = self.obj_model.names[cid]
+                        parsed_obj.append((x1, y1, x2, y2, c, cid, cname))
 
                 # Parse hand boxes
                 parsed_hand = []
@@ -404,18 +406,11 @@ def main():
             # Create display copy so annotations do NOT alter raw frame
             display_frame = raw_frame.copy()
 
-            # Draw general object bounding boxes (Persons, items)
-            for x1, y1, x2, y2, conf, cls_id, class_name in obj_boxes:
-                if class_name == "person":
-                    color = (0, 255, 0)   # Clean bright green for persons
-                else:
-                    hue = (cls_id * 37) % 180
-                    r, g, b = [int(c * 255) for c in colorsys.hsv_to_rgb(hue / 180.0, 0.9, 0.95)]
-                    color = (b, g, r)
+            # Draw Person bounding boxes (clean bright green - only persons)
+            for x1, y1, x2, y2, conf, cls_id, class_name in person_boxes:
+                draw_box(display_frame, x1, y1, x2, y2, f"Person {conf:.2f}", (0, 255, 0))
 
-                draw_box(display_frame, x1, y1, x2, y2, f"{class_name.capitalize()} {conf:.2f}", color)
-
-            # Draw hand bounding boxes (high-visibility orange)
+            # Draw Hand bounding boxes (high-visibility orange - only hands)
             for x1, y1, x2, y2, conf in hand_boxes:
                 draw_box(display_frame, x1, y1, x2, y2, f"Hand {conf:.2f}", HAND_BOX_COLOR)
 

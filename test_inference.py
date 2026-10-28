@@ -96,10 +96,11 @@ def run_batch_inference():
 
         annotated_img = img.copy()
 
-        # 1. Run Person / General Object Detection
+        # 1. Run Person Detection ONLY (class 0)
         res_obj = obj_model.predict(
             source=img,
             imgsz=IMGSZ,
+            classes=[0],
             conf=CONF_THRESHOLD,
             verbose=False
         )
@@ -119,24 +120,16 @@ def run_batch_inference():
         person_count = 0
         hand_count = len(hand_boxes)
 
-        # Draw objects
+        # Draw persons
         for b in obj_boxes:
-            x1, y1, x2, y2 = map(int, b.xyxy[0])
-            conf = float(b.conf[0])
             cid = int(b.cls[0])
-            cname = obj_model.names[cid]
-
-            if cname == "person":
+            if cid == 0:
+                x1, y1, x2, y2 = map(int, b.xyxy[0])
+                conf = float(b.conf[0])
                 person_count += 1
-                color = (0, 255, 0)
-            else:
-                hue = (cid * 37) % 180
-                r, g, b_val = [int(c * 255) for c in colorsys.hsv_to_rgb(hue / 180.0, 0.9, 0.95)]
-                color = (b_val, g, r)
-
-            label = f"{cname.capitalize()} {conf:.2f}"
-            detected_items.append(label)
-            draw_box(annotated_img, x1, y1, x2, y2, label, color)
+                label = f"Person {conf:.2f}"
+                detected_items.append(label)
+                draw_box(annotated_img, x1, y1, x2, y2, label, (0, 255, 0))
 
         # Draw hands
         for b in hand_boxes:

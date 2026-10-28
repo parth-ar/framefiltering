@@ -306,29 +306,47 @@ class FrameScorer:
                 polygon_pts, frame_w, frame_h):
         """Returns dict: total, person_score, hand_score, motion_score."""
 
-        # Person score
+        # Person score (proximity-weighted to ROI)
         person_score = 0.0
         if person_boxes:
-            max_conf     = max(b[4] for b in person_boxes)
-            person_score = SCORE_PERSON_FLAT + SCORE_PERSON_CONF * max_conf
-        person_score = min(person_score, SCORE_PERSON_FLAT + SCORE_PERSON_CONF)
+            if polygon_pts and len(polygon_pts) >= 3:
+                cx, cy = roi_centroid_px(polygon_pts, frame_w, frame_h)
+                diag = math.hypot(frame_w, frame_h)
+                max_dist = diag * 0.5
+                best_p_score = 0.0
+                for pb in person_boxes:
+                    px1, py1, px2, py2, pconf = pb[0], pb[1], pb[2], pb[3], pb[4]
+                    closest_x = max(px1, min(cx, px2))
+                    closest_y = max(py1, min(cy, py2))
+                    p_dist = math.hypot(closest_x - cx, closest_y - cy)
+                    p_prox = max(0.0, 1.0 - p_dist / max_dist)
+                    cand_score = (SCORE_PERSON_FLAT + SCORE_PERSON_CONF * pconf) * p_prox
+                    if cand_score > best_p_score:
+                        best_p_score = cand_score
+                person_score = min(best_p_score, SCORE_PERSON_FLAT + SCORE_PERSON_CONF)
+            else:
+                max_conf = max(b[4] for b in person_boxes)
+                person_score = min(SCORE_PERSON_FLAT + SCORE_PERSON_CONF * max_conf,
+                                   SCORE_PERSON_FLAT + SCORE_PERSON_CONF)
 
         # Hand proximity score
         hand_score = 0.0
         if hand_boxes:
             if polygon_pts and len(polygon_pts) >= 3:
                 cx, cy = roi_centroid_px(polygon_pts, frame_w, frame_h)
+                diag = math.hypot(frame_w, frame_h)
+                max_dist = diag * 0.5
+                best_h_prox = 0.0
+                for hb in hand_boxes:
+                    hcx = (hb[0] + hb[2]) / 2
+                    hcy = (hb[1] + hb[3]) / 2
+                    dist = math.hypot(hcx - cx, hcy - cy)
+                    prox = max(0.0, 1.0 - dist / max_dist)
+                    best_h_prox = max(best_h_prox, prox)
+                hand_score = SCORE_HAND_PROX * best_h_prox
             else:
-                cx, cy = frame_w // 2, frame_h // 2
-            diag     = math.hypot(frame_w, frame_h)
-            best     = 0.0
-            for hb in hand_boxes:
-                hcx  = (hb[0] + hb[2]) / 2
-                hcy  = (hb[1] + hb[3]) / 2
-                dist = math.hypot(hcx - cx, hcy - cy)
-                prox = max(0.0, 1.0 - dist / (diag * 0.5))
-                best = max(best, prox)
-            hand_score = SCORE_HAND_PROX * best
+                max_h_conf = max(b[4] for b in hand_boxes)
+                hand_score = SCORE_HAND_PROX * max_h_conf
 
         # Motion score
         motion_score = 0.0
@@ -398,8 +416,10 @@ class AsyncDetector:
 
             t0 = time.time()
             try:
-                res_obj  = self.obj_model.predict(
+                # Detect ONLY persons (class 0) - ignores all other objects
+                res_obj = self.obj_model.predict(
                     source=frame_to_process, imgsz=self.imgsz,
+                    classes=[0],
                     conf=conf, verbose=False, device=self.device)
                 res_hand = self.hand_model.predict(
                     source=frame_to_process, imgsz=self.imgsz,
@@ -407,11 +427,12 @@ class AsyncDetector:
 
                 parsed_obj = []
                 for b in res_obj[0].boxes:
-                    x1, y1, x2, y2 = map(int, b.xyxy[0])
-                    c    = float(b.conf[0])
-                    cid  = int(b.cls[0])
-                    name = self.obj_model.names[cid]
-                    parsed_obj.append((x1, y1, x2, y2, c, cid, name))
+                    cid = int(b.cls[0])
+                    if cid == 0:  # Only person
+                        x1, y1, x2, y2 = map(int, b.xyxy[0])
+                        c    = float(b.conf[0])
+                        name = self.obj_model.names[cid]
+                        parsed_obj.append((x1, y1, x2, y2, c, cid, name))
 
                 parsed_hand = []
                 for b in res_hand[0].boxes:
@@ -800,34 +821,41 @@ def main():
             draw_roi_polygon(disp, polygon_pts, is_roi_drawing, roi_drawing_pts, current_mouse_pos)
             draw_motion_contours(disp, latest_motion_cnts)
 
-            # Person & object boxes
-            for x1, y1, x2, y2, conf, cls_id, name in obj_boxes:
-                if name == "person":
-                    draw_box(disp, x1, y1, x2, y2,
-                             f"Person {conf:.2f}", COLOR_PERSON)
-                else:
-                    hue = (cls_id * 37) % 180
-                    r, g, b = [int(c * 255) for c in
-                                colorsys.hsv_to_rgb(hue / 180.0, 0.9, 0.95)]
-                    draw_box(disp, x1, y1, x2, y2,
-                             f"{name.capitalize()} {conf:.2f}", (b, g, r))
-
-            # Hand boxes with proximity line
             has_roi = bool(polygon_pts and len(polygon_pts) >= 3)
             if has_roi:
                 roi_cx, roi_cy = roi_centroid_px(polygon_pts, frame_w, frame_h)
             else:
                 roi_cx, roi_cy = frame_w // 2, frame_h // 2
 
-            for x1, y1, x2, y2, conf in hand_boxes:
-                hcx     = (x1 + x2) // 2
-                hcy     = (y1 + y2) // 2
-                dist_px = int(math.hypot(hcx - roi_cx, hcy - roi_cy))
-                draw_box(disp, x1, y1, x2, y2,
-                         f"Hand {conf:.2f}  d={dist_px}px", COLOR_HAND)
+            # 1. Person boxes with proximity line & distance indicator (ONLY PERSON)
+            for x1, y1, x2, y2, conf, cls_id, name in person_boxes:
                 if has_roi:
+                    closest_x = max(x1, min(roi_cx, x2))
+                    closest_y = max(y1, min(roi_cy, y2))
+                    p_dist_px = int(math.hypot(closest_x - roi_cx, closest_y - roi_cy))
+                    dist_tag = "IN ROI" if p_dist_px == 0 else f"d={p_dist_px}px"
+                    draw_box(disp, x1, y1, x2, y2,
+                             f"Person {conf:.2f}  {dist_tag}", COLOR_PERSON)
+                    if p_dist_px > 0:
+                        cv2.line(disp, (closest_x, closest_y), (roi_cx, roi_cy),
+                                 COLOR_PERSON, 1, cv2.LINE_AA)
+                else:
+                    draw_box(disp, x1, y1, x2, y2,
+                             f"Person {conf:.2f}", COLOR_PERSON)
+
+            # 2. Hand boxes with proximity line & distance indicator (ONLY HAND)
+            for x1, y1, x2, y2, conf in hand_boxes:
+                hcx       = (x1 + x2) // 2
+                hcy       = (y1 + y2) // 2
+                h_dist_px = int(math.hypot(hcx - roi_cx, hcy - roi_cy))
+                if has_roi:
+                    draw_box(disp, x1, y1, x2, y2,
+                             f"Hand {conf:.2f}  d={h_dist_px}px", COLOR_HAND)
                     cv2.line(disp, (hcx, hcy), (roi_cx, roi_cy),
                              COLOR_HAND, 1, cv2.LINE_AA)
+                else:
+                    draw_box(disp, x1, y1, x2, y2,
+                             f"Hand {conf:.2f}", COLOR_HAND)
 
             draw_score_panel(disp, latest_scores, score_history)
 
