@@ -1,22 +1,30 @@
 """
 scored_live.py -- Frame Scoring System for Waste-Collection Camera
 =================================================================
-Integrates:
-  - YOLOv8 person & hand detection (from live_person.py)
-  - Background-subtraction motion detection (ported from MotionFull-main/motion.py)
+Cloud-Deployment Model:
+  Frames arriving in the cloud are already triggered by edge motion detection.
+  Scoring evaluates Person and Hand presence & proximity to the designated ROI (bin).
 
-Scoring model (max 100 pts per frame):
+Scoring Model (max 100 pts per frame):
   COMPONENT           MAX   LOGIC
-  Person presence      30   flat bonus if >= 1 person detected
-  Person confidence    10   scaled by max person confidence [0-1]
-  Hand proximity       50   inverse-distance to ROI centroid
-  Motion activity      10   scaled by contour area in ROI
+  Person Proximity     68   Base 48 + 20*conf when box center is near ROI edge (<= 120px).
+                            Generous acceptance distance allows a person near or in front
+                            of the bin to reach >= 60 pts on their own if hands are obscured.
+                            Smooth falloff over 160px beyond 120px.
+  Hand Proximity       32   Up to 32 pts when hand center is near ROI edge (<= 70px).
+                            Acts as a booster (total score up to 100 pts).
+
+Deployment Decision:
+  >= 60 pts  -> ACCEPTED (Dumping / person activity at bin)
+  <  60 pts  -> REJECTED (Passerby / empty scene / person far away)
 
 Controls:
   q         Quit
   w / s     Raise / lower YOLO confidence threshold
-  r         Toggle ROI drawing mode (left-click to place, right-click to confirm)
-  c         Reset ROI polygon back to default
+  r         Reset ROI polygon back to default centered box
+  d         Draw custom ROI polygon (left-click points, right-click to save)
+  c         Clear ROI polygon (full-frame mode)
+  u / bksp  Undo last point during ROI drawing
   1/2/3     Save raw frame to frames/no_person, person_no_dump, dumping
 """
 
@@ -58,7 +66,11 @@ if DEVICE == "cpu":
 MODEL_WEIGHTS      = "yolov8n.pt"
 HAND_MODEL_WEIGHTS = "hand_yolov8n.pt"
 HAND_MODEL_URL     = "https://huggingface.co/Bingsu/adetailer/resolve/main/hand_yolov8n.pt"
-INFERENCE_SIZE     = 320
+INFERENCE_SIZE     = 320   # Fast processing configuration (320x320)
+
+# Camera Preview Resolution (720p HD for crisp, high-quality visual preview)
+PREVIEW_WIDTH      = 1280
+PREVIEW_HEIGHT     = 720
 
 DEFAULT_CONF_THRESHOLD = 0.25
 MIN_CONF_THRESHOLD     = 0.05
@@ -67,19 +79,33 @@ CONF_STEP              = 0.05
 
 LOG_FILE = "scored_log.csv"
 
-# Motion detection constants (from MotionFull-main/motion.py, unchanged)
-DIFF_THRESHOLD   = 22
-MIN_CONTOUR_AREA = 350
-BG_ALPHA         = 0.04
-WARMUP_FRAMES    = 30
+# ------------------------------------------------------------------
+# SCORING CONFIGURATION (Person + Hand Distance to ROI EDGE)
+# ------------------------------------------------------------------
+# Proximity is computed from the CENTER of bounding boxes to the nearest EDGE
+# of the ROI polygon (0px if inside). This prevents issues where large ROIs
+# cause center-measured distances to be artificially inflated.
+# Weights:
+#   Person Proximity (Max 68 pts): Base 48 + 20*conf.
+#   Hand Proximity   (Max 32 pts): Up to 32 pts when hand is near the ROI edge.
+#   Acceptance Thresh: 60 pts.
+# Generous acceptance distance: person center within 120px of the bin edge
+# scores >= 60 pts on their own (ACCEPTED), even if hands are obscured.
+SCORE_PERSON_BASE = 48   # Base presence points for person
+SCORE_PERSON_CONF = 20   # Up to 20 pts based on person confidence (Max Person = 68)
+SCORE_HAND_PROX   = 32   # Up to 32 pts for hand detection & proximity booster (Max Hand = 32)
 
-# Scoring weights
-SCORE_PERSON_FLAT = 30   # flat bonus for person present
-SCORE_PERSON_CONF = 10   # up to 10 pts for confidence
-SCORE_HAND_PROX   = 50   # up to 50 pts for hand proximity to ROI centroid
-SCORE_MOTION      = 10   # up to 10 pts for motion activity inside ROI
+SCORE_HI_THRESH   = 60   # Acceptance threshold
+SCORE_MED_THRESH  = 35   # Review / medium threshold
 
-# Default ROI polygon (normalised [0-1] x, y) - same format as MotionFull
+# Proximity zones (measured from bounding box CENTER to nearest ROI EDGE, in pixels)
+PERSON_NEAR_ZONE_PX = 120  # Generous acceptance distance: within 120px of bin edge is 100% proximity
+PERSON_FALLOFF_PX   = 160  # Distance beyond near-zone at which proximity drops to 0 (280px total)
+
+HAND_NEAR_ZONE_PX   = 70   # Hand center within 70px of bin edge is 100% proximity
+HAND_FALLOFF_PX     = 180  # Distance beyond near-zone for hand falloff
+
+# Default ROI polygon (normalised [0-1] x, y)
 DEFAULT_ROI_POLYGON = [
     [0.35, 0.20],
     [0.65, 0.20],
@@ -100,13 +126,9 @@ COLOR_PERSON    = (0,  230,  80)
 COLOR_HAND      = (0,  165, 255)
 COLOR_ROI_FILL  = (0,   80, 180)
 COLOR_ROI_EDGE  = (0,  220, 255)
-COLOR_MOTION    = (0,  255, 200)
 COLOR_SCORE_HI  = (0,  255, 100)
 COLOR_SCORE_MED = (0,  200, 255)
 COLOR_SCORE_LO  = (0,  100, 255)
-
-SCORE_HI_THRESH  = 65
-SCORE_MED_THRESH = 35
 
 SCORE_HISTORY_LEN = 120
 
@@ -139,10 +161,11 @@ def init_logger():
     if not file_exists:
         writer.writerow([
             "timestamp", "total_score",
-            "person_score", "hand_score", "motion_score",
+            "person_score", "hand_score",
+            "person_prox", "hand_prox",
             "n_persons", "n_hands",
             "max_person_conf", "max_hand_conf",
-            "motion_area", "threshold",
+            "accepted", "threshold",
         ])
         handle.flush()
     return handle, writer
@@ -202,14 +225,47 @@ def roi_centroid_px(polygon_pts, w, h):
     return cx, cy
 
 
-def apply_roi_mask(thresh, polygon_pts, frame_w, frame_h):
-    """Mask a binary threshold image to only the ROI polygon."""
+def point_to_polygon_edge_dist(pt, polygon_pts, frame_w, frame_h):
+    """
+    Computes Euclidean distance from a pixel point (px, py) to the nearest EDGE
+    of the ROI polygon. If the point is INSIDE or ON the polygon boundary, distance is 0.0.
+    Also returns the closest point on the polygon boundary (cx_edge, cy_edge).
+    """
     if not polygon_pts or len(polygon_pts) < 3:
-        return thresh
-    pts_array = poly_pixel_pts(polygon_pts, frame_w, frame_h)
-    mask = np.zeros((frame_h, frame_w), dtype=np.uint8)
-    cv2.fillPoly(mask, [pts_array], 255)
-    return cv2.bitwise_and(thresh, mask)
+        return 0.0, (int(round(pt[0])), int(round(pt[1])))
+
+    pts = poly_pixel_pts(polygon_pts, frame_w, frame_h)
+    px, py = float(pt[0]), float(pt[1])
+
+    # Check if point is inside or on polygon boundary
+    test = cv2.pointPolygonTest(pts, (px, py), measureDist=False)
+    if test >= 0:
+        return 0.0, (int(round(px)), int(round(py)))
+
+    # Point is outside: find minimum distance across all polygon edge segments
+    min_dist = float("inf")
+    closest_pt = (int(round(px)), int(round(py)))
+    n = len(pts)
+    for i in range(n):
+        p1 = pts[i].astype(float)
+        p2 = pts[(i + 1) % n].astype(float)
+
+        dx = p2[0] - p1[0]
+        dy = p2[1] - p1[1]
+        seg_len_sq = dx * dx + dy * dy
+        if seg_len_sq == 0:
+            d = math.hypot(px - p1[0], py - p1[1])
+            cp = p1
+        else:
+            t = max(0.0, min(1.0, ((px - p1[0]) * dx + (py - p1[1]) * dy) / seg_len_sq))
+            cp = np.array([p1[0] + t * dx, p1[1] + t * dy])
+            d = math.hypot(px - cp[0], py - cp[1])
+
+        if d < min_dist:
+            min_dist = d
+            closest_pt = (int(round(cp[0])), int(round(cp[1])))
+
+    return min_dist, closest_pt
 
 
 def draw_box(frame, x1, y1, x2, y2, label, color):
@@ -231,135 +287,110 @@ def score_color(score):
 
 
 # ------------------------------------------------------------------
-# MOTION DETECTOR (ported from MotionFull-main/motion.py)
-# ------------------------------------------------------------------
-
-class MotionDetector:
-    """
-    Background-subtraction motion detector.
-    Algorithm parameters are IDENTICAL to MotionFull-main/motion.py:
-      DIFF_THRESHOLD   = 22
-      MIN_CONTOUR_AREA = 350
-      BG_ALPHA         = 0.04
-      WARMUP_FRAMES    = 30
-    """
-
-    def __init__(self):
-        self.bg_frame    = None
-        self.frame_count = 0
-
-    def _update_bg(self, gray_frame):
-        """Update running background model. Returns threshold image or None."""
-        if self.bg_frame is None:
-            self.bg_frame    = gray_frame.astype("float")
-            self.frame_count = 0
-            return None
-
-        cv2.accumulateWeighted(gray_frame, self.bg_frame, BG_ALPHA)
-        self.frame_count += 1
-
-        if self.frame_count < WARMUP_FRAMES:
-            return None
-
-        bg_uint8    = cv2.convertScaleAbs(self.bg_frame)
-        frame_delta = cv2.absdiff(bg_uint8, gray_frame)
-        _, thresh   = cv2.threshold(frame_delta, DIFF_THRESHOLD, 255,
-                                    cv2.THRESH_BINARY)
-        thresh = cv2.dilate(thresh, None, iterations=2)
-        thresh = cv2.erode(thresh, None, iterations=1)
-        return thresh
-
-    def detect(self, gray_frame, polygon_pts, frame_w, frame_h):
-        """
-        Full pipeline: update background, apply ROI mask, find contours.
-        Returns: (motion_detected: bool, total_area: int, contours: list)
-        """
-        thresh = self._update_bg(gray_frame)
-        if thresh is None:
-            return False, 0, []
-
-        roi_thresh = apply_roi_mask(thresh, polygon_pts, frame_w, frame_h)
-        cnts, _    = cv2.findContours(roi_thresh, cv2.RETR_EXTERNAL,
-                                      cv2.CHAIN_APPROX_SIMPLE)
-        valid      = [c for c in cnts if cv2.contourArea(c) >= MIN_CONTOUR_AREA]
-        total_area = int(sum(cv2.contourArea(c) for c in valid))
-
-        return len(valid) > 0, total_area, valid
-
-
-# ------------------------------------------------------------------
-# SCORING ENGINE
+# SCORING ENGINE (Distance to ROI Edge)
 # ------------------------------------------------------------------
 
 class FrameScorer:
     """
-    Computes a 0-100 frame quality score.
+    Computes a 0-100 frame quality score based on Person and Hand distance to the nearest ROI EDGE.
 
-    Person presence  : 30 pts flat + 10 pts scaled by confidence = max 40
-    Hand proximity   : 0-50 pts (inverse distance to ROI centroid)
-    Motion in ROI    : 0-10 pts (scaled by area, caps at MAX_MOTION_AREA)
+    Cloud deployment context: frames received by the cloud system are already triggered
+    by edge motion sensors/detectors, so computing motion here is redundant.
+
+    Distance to ROI Edge Logic:
+      - Person proximity (Max 68 pts):
+          * Measured from the CENTER of the person bounding box (pcx, pcy) to the nearest ROI polygon EDGE.
+          * If center is INSIDE or within PERSON_NEAR_ZONE_PX (120px) of the ROI edge, proximity is 1.0.
+          * Score = (SCORE_PERSON_BASE + SCORE_PERSON_CONF * conf) * prox_factor.
+          * With Base=48 and Conf=20, a person standing near or in front of the bin (<= 120px from edge)
+            scores >= 60 on their own (ACCEPTED) even if hands are obscured!
+          * Smooth falloff over PERSON_FALLOFF_PX (160px); drops to 0 beyond 280px.
+      - Hand presence & proximity (Max 32 pts):
+          * Measured from the CENTER of the hand bounding box (hcx, hcy) to the nearest ROI EDGE.
+          * Within HAND_NEAR_ZONE_PX (70px) of edge or inside, proximity is 1.0.
+          * Score = SCORE_HAND_PROX * h_prox * (0.5 + 0.5 * hconf).
+          * Boosts the total score up to 100 pts.
+      - Total Score: min(round(person_score + hand_score, 1), 100.0)
     """
 
-    MAX_MOTION_AREA = 60_000  # px^2 at which motion score saturates
+    def compute(self, person_boxes, hand_boxes, polygon_pts, frame_w, frame_h):
+        """
+        Returns dict:
+          total: float (0-100)
+          person_score: float (0-68)
+          hand_score: float (0-32)
+          person_prox: float (0-1)
+          hand_prox: float (0-1)
+        """
+        has_roi = bool(polygon_pts and len(polygon_pts) >= 3)
 
-    def compute(self, person_boxes, hand_boxes, motion_area,
-                polygon_pts, frame_w, frame_h):
-        """Returns dict: total, person_score, hand_score, motion_score."""
+        # Scale proximity zones proportionally to frame width so distance criteria
+        # remains identical across 640x480, 1280x720 (720p), and 1920x1080 (1080p).
+        res_scale   = frame_w / 640.0
+        near_zone_p = PERSON_NEAR_ZONE_PX * res_scale
+        falloff_p   = PERSON_FALLOFF_PX * res_scale
+        near_zone_h = HAND_NEAR_ZONE_PX * res_scale
+        falloff_h   = HAND_FALLOFF_PX * res_scale
 
-        # Person score (proximity-weighted to ROI)
+        # 1. Person Scoring (Max 68 pts) - Center to nearest ROI edge
         person_score = 0.0
+        best_p_prox = 0.0
         if person_boxes:
-            if polygon_pts and len(polygon_pts) >= 3:
-                cx, cy = roi_centroid_px(polygon_pts, frame_w, frame_h)
-                diag = math.hypot(frame_w, frame_h)
-                max_dist = diag * 0.5
-                best_p_score = 0.0
+            if has_roi:
+                best_cand = 0.0
                 for pb in person_boxes:
                     px1, py1, px2, py2, pconf = pb[0], pb[1], pb[2], pb[3], pb[4]
-                    closest_x = max(px1, min(cx, px2))
-                    closest_y = max(py1, min(cy, py2))
-                    p_dist = math.hypot(closest_x - cx, closest_y - cy)
-                    p_prox = max(0.0, 1.0 - p_dist / max_dist)
-                    cand_score = (SCORE_PERSON_FLAT + SCORE_PERSON_CONF * pconf) * p_prox
-                    if cand_score > best_p_score:
-                        best_p_score = cand_score
-                person_score = min(best_p_score, SCORE_PERSON_FLAT + SCORE_PERSON_CONF)
+                    pcx = (px1 + px2) / 2
+                    pcy = (py1 + py2) / 2
+                    p_dist, _ = point_to_polygon_edge_dist((pcx, pcy), polygon_pts, frame_w, frame_h)
+                    if p_dist <= near_zone_p:
+                        prox = 1.0
+                    else:
+                        prox = max(0.0, 1.0 - (p_dist - near_zone_p) / falloff_p)
+                    cand_score = (SCORE_PERSON_BASE + SCORE_PERSON_CONF * pconf) * prox
+                    if cand_score > best_cand:
+                        best_cand = cand_score
+                        best_p_prox = prox
+                person_score = min(best_cand, float(SCORE_PERSON_BASE + SCORE_PERSON_CONF))
             else:
                 max_conf = max(b[4] for b in person_boxes)
-                person_score = min(SCORE_PERSON_FLAT + SCORE_PERSON_CONF * max_conf,
-                                   SCORE_PERSON_FLAT + SCORE_PERSON_CONF)
+                best_p_prox = 1.0
+                person_score = min(float(SCORE_PERSON_BASE + SCORE_PERSON_CONF * max_conf),
+                                   float(SCORE_PERSON_BASE + SCORE_PERSON_CONF))
 
-        # Hand proximity score
+        # 2. Hand Scoring (Max 32 pts) - Center to nearest ROI edge
         hand_score = 0.0
+        best_h_prox = 0.0
         if hand_boxes:
-            if polygon_pts and len(polygon_pts) >= 3:
-                cx, cy = roi_centroid_px(polygon_pts, frame_w, frame_h)
-                diag = math.hypot(frame_w, frame_h)
-                max_dist = diag * 0.5
-                best_h_prox = 0.0
+            if has_roi:
+                best_cand = 0.0
                 for hb in hand_boxes:
-                    hcx = (hb[0] + hb[2]) / 2
-                    hcy = (hb[1] + hb[3]) / 2
-                    dist = math.hypot(hcx - cx, hcy - cy)
-                    prox = max(0.0, 1.0 - dist / max_dist)
-                    best_h_prox = max(best_h_prox, prox)
-                hand_score = SCORE_HAND_PROX * best_h_prox
+                    hx1, hy1, hx2, hy2, hconf = hb[0], hb[1], hb[2], hb[3], hb[4]
+                    hcx = (hx1 + hx2) / 2
+                    hcy = (hy1 + hy2) / 2
+                    h_dist, _ = point_to_polygon_edge_dist((hcx, hcy), polygon_pts, frame_w, frame_h)
+                    if h_dist <= near_zone_h:
+                        prox = 1.0
+                    else:
+                        prox = max(0.0, 1.0 - (h_dist - near_zone_h) / falloff_h)
+                    cand_score = SCORE_HAND_PROX * prox * (0.5 + 0.5 * hconf)
+                    if cand_score > best_cand:
+                        best_cand = cand_score
+                        best_h_prox = prox
+                hand_score = min(best_cand, float(SCORE_HAND_PROX))
             else:
                 max_h_conf = max(b[4] for b in hand_boxes)
-                hand_score = SCORE_HAND_PROX * max_h_conf
+                best_h_prox = 1.0
+                hand_score = SCORE_HAND_PROX * (0.5 + 0.5 * max_h_conf)
 
-        # Motion score
-        motion_score = 0.0
-        if motion_area > 0:
-            motion_score = SCORE_MOTION * min(1.0, motion_area / self.MAX_MOTION_AREA)
-
-        total = min(round(person_score + hand_score + motion_score, 1), 100.0)
+        total = min(round(person_score + hand_score, 1), 100.0)
 
         return {
             "total":        total,
             "person_score": round(person_score, 1),
-            "hand_score":   round(hand_score,   1),
-            "motion_score": round(motion_score, 1),
+            "hand_score":   round(hand_score, 1),
+            "person_prox":  round(best_p_prox, 2),
+            "hand_prox":    round(best_h_prox, 2),
         }
 
 
@@ -508,97 +539,144 @@ def draw_roi_polygon(frame, polygon_pts, is_drawing=False, drawing_pts=None, mou
                     cv2.line(frame, mouse_pos, drawing_pts[0], (0, 180, 180), 1, cv2.LINE_AA)
 
 
-def draw_motion_contours(frame, contours):
-    """Draw bounding boxes around motion contours inside the ROI."""
-    for c in contours:
-        x, y, cw, ch = cv2.boundingRect(c)
-        cv2.rectangle(frame, (x, y), (x + cw, y + ch), COLOR_MOTION, 1)
+def draw_deployment_status(frame, scores, person_count, hand_count, has_roi):
+    """
+    On-screen field in the camera view displaying whether the current frame
+    would be ACCEPTED or REJECTED in a deployed cloud monitoring scene.
+    """
+    total = scores["total"]
+    person_score = scores["person_score"]
+    hand_score = scores["hand_score"]
+
+    is_accepted = total >= SCORE_HI_THRESH  # 60
+
+    if is_accepted:
+        status_text = "DEPLOYED SCENE: ACCEPTED"
+        if hand_count > 0 and hand_score >= 10:
+            detail_text = f"Person + Hands at Bin ({total:.0f}>={SCORE_HI_THRESH})"
+        else:
+            detail_text = f"Person Near Bin [No Hands] ({total:.0f}>={SCORE_HI_THRESH})"
+        badge_bg    = (15, 42, 22)
+        border_col  = (0, 255, 100)
+        text_col    = (0, 255, 100)
+    else:
+        status_text = "DEPLOYED SCENE: REJECTED"
+        if person_count == 0:
+            reason = "No Person"
+        elif person_score < SCORE_HI_THRESH and hand_count == 0:
+            reason = f"Person Far from Bin Edge (Score {total:.0f} < {SCORE_HI_THRESH})"
+        else:
+            reason = f"Score {total:.0f} < {SCORE_HI_THRESH}"
+        detail_text = reason
+        badge_bg    = (22, 16, 20)
+        border_col  = (70, 70, 130)
+        text_col    = (150, 150, 230)
+
+    bx, by = 10, 52
+    full_label = f"{status_text} | {detail_text}"
+    (tw, th), _ = cv2.getTextSize(full_label, cv2.FONT_HERSHEY_SIMPLEX, 0.44, 1)
+
+    bw = tw + 22
+    bh = th + 12
+
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (bx, by), (bx + bw, by + bh), badge_bg, -1)
+    cv2.addWeighted(overlay, 0.85, frame, 0.15, 0, frame)
+    cv2.rectangle(frame, (bx, by), (bx + bw, by + bh), border_col, 2 if is_accepted else 1)
+
+    # Status indicator bullet dot
+    dot_x = bx + 9
+    dot_y = by + bh // 2
+    cv2.circle(frame, (dot_x, dot_y), 4, border_col, -1)
+
+    cv2.putText(frame, full_label, (bx + 18, by + th + 5),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.44, text_col, 1, cv2.LINE_AA)
 
 
 def draw_score_panel(frame, scores, score_history):
     """
-    Draw the live scoring panel on the right side of the frame.
-      - Big numeric total score
-      - Per-component horizontal bars (Person, Hand, Motion)
-      - 120-frame spark-line history with colour-coded segments
+    Compact live scoring HUD on the right side of the frame.
+    Footprint: 145px width x ~150px height.
+    Displays Person proximity (max 68) and Hand proximity (max 32).
     """
     h, w = frame.shape[:2]
 
-    panel_w = 200
-    panel_x = w - panel_w - 8
-    panel_y = 50
-    panel_h = 320
-    bar_h   = 16
+    panel_w = 145
+    panel_x = w - panel_w - 6
+    panel_y = 52
+    panel_h = 148
 
     # Panel background
     overlay = frame.copy()
     cv2.rectangle(overlay,
-                  (panel_x - 6, panel_y - 6),
-                  (panel_x + panel_w + 6, panel_y + panel_h + 6),
+                  (panel_x - 4, panel_y - 4),
+                  (panel_x + panel_w + 4, panel_y + panel_h + 4),
                   (12, 12, 18), -1)
-    cv2.addWeighted(overlay, 0.80, frame, 0.20, 0, frame)
+    cv2.addWeighted(overlay, 0.78, frame, 0.22, 0, frame)
     cv2.rectangle(frame,
-                  (panel_x - 6, panel_y - 6),
-                  (panel_x + panel_w + 6, panel_y + panel_h + 6),
-                  (60, 60, 80), 1)
+                  (panel_x - 4, panel_y - 4),
+                  (panel_x + panel_w + 4, panel_y + panel_h + 4),
+                  (50, 50, 70), 1)
 
     total = scores["total"]
     s_col = score_color(total)
+    is_accepted = total >= SCORE_HI_THRESH
 
-    # Title
-    cv2.putText(frame, "FRAME SCORE", (panel_x, panel_y + 14),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.52, (200, 200, 220), 1, cv2.LINE_AA)
+    # Row 1: Header + Acceptance mini-pill
+    cv2.putText(frame, "SCORE", (panel_x, panel_y + 12),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.38, (180, 180, 200), 1, cv2.LINE_AA)
 
-    # Big score number
-    big_label  = f"{total:.0f}"
-    (bw, _), _ = cv2.getTextSize(big_label, cv2.FONT_HERSHEY_DUPLEX, 2.2, 3)
-    cv2.putText(frame, big_label,
-                (panel_x + (panel_w - bw) // 2, panel_y + 75),
-                cv2.FONT_HERSHEY_DUPLEX, 2.2, s_col, 3, cv2.LINE_AA)
-    cv2.putText(frame, "/ 100",
-                (panel_x + (panel_w - bw) // 2 + bw - 10, panel_y + 75),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (140, 140, 160), 1, cv2.LINE_AA)
+    tag_str = "ACCEPT" if is_accepted else "REJECT"
+    tag_col = (0, 255, 100) if is_accepted else (120, 120, 180)
+    (tw, _), _ = cv2.getTextSize(tag_str, cv2.FONT_HERSHEY_SIMPLEX, 0.34, 1)
+    cv2.rectangle(frame, (panel_x + panel_w - tw - 8, panel_y + 1),
+                  (panel_x + panel_w, panel_y + 15), (25, 25, 35), -1)
+    cv2.rectangle(frame, (panel_x + panel_w - tw - 8, panel_y + 1),
+                  (panel_x + panel_w, panel_y + 15), tag_col, 1)
+    cv2.putText(frame, tag_str, (panel_x + panel_w - tw - 4, panel_y + 12),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.34, tag_col, 1, cv2.LINE_AA)
 
-    # Full-width score bar
-    bar_y  = panel_y + 85
+    # Row 2: Score Number
+    score_txt = f"{total:.0f}"
+    (bw, _), _ = cv2.getTextSize(score_txt, cv2.FONT_HERSHEY_DUPLEX, 1.1, 2)
+    cv2.putText(frame, score_txt, (panel_x, panel_y + 40),
+                cv2.FONT_HERSHEY_DUPLEX, 1.1, s_col, 2, cv2.LINE_AA)
+    cv2.putText(frame, "/100", (panel_x + bw + 4, panel_y + 38),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.36, (140, 140, 160), 1, cv2.LINE_AA)
+
+    # Row 3: Slim Total Bar
+    bar_y = panel_y + 46
     fill_w = int(panel_w * total / 100.0)
     cv2.rectangle(frame, (panel_x, bar_y),
-                  (panel_x + panel_w, bar_y + 8), (40, 40, 50), -1)
+                  (panel_x + panel_w, bar_y + 4), (35, 35, 45), -1)
     cv2.rectangle(frame, (panel_x, bar_y),
-                  (panel_x + fill_w, bar_y + 8), s_col, -1)
+                  (panel_x + fill_w, bar_y + 4), s_col, -1)
 
-    # Component breakdown bars
+    # Row 4: Component breakdown (Person max 68, Hand max 32) - NO MOTION
     components = [
-        ("Person", scores["person_score"],
-         SCORE_PERSON_FLAT + SCORE_PERSON_CONF, COLOR_PERSON),
-        ("Hand",   scores["hand_score"],   SCORE_HAND_PROX, COLOR_HAND),
-        ("Motion", scores["motion_score"], SCORE_MOTION,    COLOR_MOTION),
+        ("P", scores["person_score"], SCORE_PERSON_BASE + SCORE_PERSON_CONF, COLOR_PERSON),
+        ("H", scores["hand_score"],   SCORE_HAND_PROX, COLOR_HAND),
     ]
 
-    cy = bar_y + 22
+    cy = bar_y + 14
     for lbl, val, max_val, color in components:
-        pct  = val / max_val if max_val > 0 else 0
-        fill = int(panel_w * pct)
+        pct = val / max_val if max_val > 0 else 0
+        fill = int((panel_w - 55) * pct)
 
-        cv2.putText(frame, lbl, (panel_x, cy + 12),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.42, (180, 180, 200), 1, cv2.LINE_AA)
-        cv2.putText(frame, f"{val:.0f}/{max_val}",
-                    (panel_x + panel_w - 55, cy + 12),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.40, color, 1, cv2.LINE_AA)
-        cy += 16
-        cv2.rectangle(frame, (panel_x, cy),
-                      (panel_x + panel_w, cy + bar_h), (30, 30, 40), -1)
-        cv2.rectangle(frame, (panel_x, cy),
-                      (panel_x + fill, cy + bar_h), color, -1)
-        cy += bar_h + 8
+        cv2.putText(frame, f"{lbl}: {val:.0f}/{max_val}",
+                    (panel_x, cy + 3),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.34, color, 1, cv2.LINE_AA)
+        cv2.rectangle(frame, (panel_x + 55, cy - 5),
+                      (panel_x + panel_w, cy - 1), (30, 30, 40), -1)
+        cv2.rectangle(frame, (panel_x + 55, cy - 5),
+                      (panel_x + 55 + fill, cy - 1), color, -1)
+        cy += 13
 
-    # Spark-line history
-    spark_y = cy + 8
-    spark_h = 60
+    # Row 5: Compact sparkline history
+    spark_y = cy + 4
+    spark_h = 28
     cv2.rectangle(frame, (panel_x, spark_y),
-                  (panel_x + panel_w, spark_y + spark_h), (25, 25, 35), -1)
-    cv2.putText(frame, "Live Feed", (panel_x, spark_y - 4),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.38, (120, 120, 140), 1, cv2.LINE_AA)
+                  (panel_x + panel_w, spark_y + spark_h), (20, 20, 28), -1)
 
     hist = list(score_history)
     if len(hist) >= 2:
@@ -608,19 +686,17 @@ def draw_score_panel(frame, scores, score_history):
             sy = spark_y + spark_h - int(s / 100.0 * spark_h)
             pts_px.append((sx, sy))
         for i in range(len(pts_px) - 1):
-            mid   = (hist[i] + hist[i + 1]) / 2
+            mid = (hist[i] + hist[i + 1]) / 2
             c_seg = score_color(mid)
             cv2.line(frame, pts_px[i], pts_px[i + 1], c_seg, 1, cv2.LINE_AA)
 
-    # Reference lines
-    for tv, tc in [(35, (0, 100, 255)), (65, (0, 200, 100))]:
-        ty = spark_y + spark_h - int(tv / 100.0 * spark_h)
-        cv2.line(frame, (panel_x, ty),
-                 (panel_x + panel_w, ty), tc, 1, cv2.LINE_AA)
+    # Reference line at 60 (Acceptance threshold)
+    ty60 = spark_y + spark_h - int(SCORE_HI_THRESH / 100.0 * spark_h)
+    cv2.line(frame, (panel_x, ty60), (panel_x + panel_w, ty60), (0, 180, 80), 1, cv2.LINE_AA)
 
 
 def draw_hud(frame, cam_fps, infer_fps, threshold,
-             person_count, hand_count, motion_area,
+             person_count, hand_count,
              has_roi, is_roi_drawing, alert_text="", device_tag="CPU"):
     """Top and bottom semi-transparent HUD strips designed to fit cleanly inside 640px."""
     fh, fw = frame.shape[:2]
@@ -631,8 +707,8 @@ def draw_hud(frame, cam_fps, infer_fps, threshold,
 
     # Top Bar: Line 1 (Cam & AI Stats) + Line 2 (Detections & ROI state)
     roi_status = "DRAWING" if is_roi_drawing else ("ACTIVE" if has_roi else "FULL-FRAME")
-    stats_l1 = f"Cam: {cam_fps:4.1f}fps | AI: {infer_fps:4.1f}fps [{device_tag}] | Conf: {threshold:.2f} (w/s)"
-    stats_l2 = f"Persons: {person_count} | Hands: {hand_count} | Motion: {motion_area:,}px | ROI: {roi_status}"
+    stats_l1 = f"Cam: {cam_fps:4.1f}fps [{fw}x{fh}] | AI: {infer_fps:4.1f}fps [{INFERENCE_SIZE}p {device_tag}] | Conf: {threshold:.2f} (w/s)"
+    stats_l2 = f"Persons: {person_count} | Hands: {hand_count} | ROI: {roi_status} | Accept Thresh: {SCORE_HI_THRESH}"
 
     cv2.putText(frame, stats_l1, (10, 18),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.44, (0, 255, 255), 1, cv2.LINE_AA)
@@ -644,14 +720,14 @@ def draw_hud(frame, cam_fps, infer_fps, threshold,
     cv2.putText(frame, hint, (10, fh - 10),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.41, (220, 220, 220), 1, cv2.LINE_AA)
 
-    # Alert Banner: High-contrast floating pill
+    # Alert Banner: High-contrast floating pill (positioned below deployment status badge)
     if alert_text:
-        (tw, th), _ = cv2.getTextSize(alert_text, cv2.FONT_HERSHEY_SIMPLEX, 0.52, 2)
-        bx, by = 10, 54
+        (tw, th), _ = cv2.getTextSize(alert_text, cv2.FONT_HERSHEY_SIMPLEX, 0.48, 2)
+        bx, by = 10, 84
         cv2.rectangle(frame, (bx, by), (bx + tw + 16, by + th + 12), (15, 15, 20), -1)
         cv2.rectangle(frame, (bx, by), (bx + tw + 16, by + th + 12), (0, 255, 120), 2)
         cv2.putText(frame, alert_text, (bx + 8, by + th + 6),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.52, (0, 255, 120), 2, cv2.LINE_AA)
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.48, (0, 255, 120), 2, cv2.LINE_AA)
 
 
 # ------------------------------------------------------------------
@@ -660,7 +736,7 @@ def draw_hud(frame, cam_fps, infer_fps, threshold,
 
 def main():
     print("=" * 65)
-    print("  Frame Scoring System -- Person + Hand Proximity + Motion")
+    print("  Frame Scoring System -- Person + Hand Proximity (Cloud Model)")
     print("=" * 65)
 
     device_str = "CPU"
@@ -692,7 +768,6 @@ def main():
 
     polygon_pts   = load_roi_polygon()
     detector      = AsyncDetector(model, hand_model, imgsz=INFERENCE_SIZE, device=DEVICE)
-    motion_det    = MotionDetector()
     scorer        = FrameScorer()
     score_history = collections.deque([0.0] * SCORE_HISTORY_LEN,
                                       maxlen=SCORE_HISTORY_LEN)
@@ -704,8 +779,8 @@ def main():
         detector.stop()
         log_handle.close()
         sys.exit(1)
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH,  640)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH,  PREVIEW_WIDTH)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, PREVIEW_HEIGHT)
 
     conf_threshold    = DEFAULT_CONF_THRESHOLD
     cam_fps           = 0.0
@@ -715,12 +790,10 @@ def main():
     is_roi_drawing    = False
     roi_drawing_pts   = []
     current_mouse_pos = (0, 0)
-    frame_w           = 640
-    frame_h           = 480
+    frame_w           = PREVIEW_WIDTH
+    frame_h           = PREVIEW_HEIGHT
     latest_scores     = {"total": 0.0, "person_score": 0.0,
-                         "hand_score": 0.0, "motion_score": 0.0}
-    latest_motion_area = 0
-    latest_motion_cnts = []
+                         "hand_score": 0.0, "person_prox": 0.0, "hand_prox": 0.0}
 
     window_name = "Frame Scoring -- Live Feed"
     cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
@@ -774,22 +847,14 @@ def main():
 
             frame_h, frame_w = raw_frame.shape[:2]
 
-            # Motion detection (synchronous on main thread - very fast)
-            gray = cv2.cvtColor(raw_frame, cv2.COLOR_BGR2GRAY)
-            gray = cv2.GaussianBlur(gray, (21, 21), 0)
-            motion_detected, motion_area, motion_cnts = motion_det.detect(
-                gray, polygon_pts, frame_w, frame_h)
-            latest_motion_area = motion_area
-            latest_motion_cnts = motion_cnts
-
             # YOLO detection (async background thread)
             detector.update_frame(raw_frame, conf_threshold)
             obj_boxes, hand_boxes, infer_fps, is_new = detector.get_detections()
             person_boxes = [b for b in obj_boxes if b[6] == "person"]
 
-            # Score the current frame
+            # Score the current frame based strictly on Person & Hand proximity to ROI
             latest_scores = scorer.compute(
-                person_boxes, hand_boxes, motion_area,
+                person_boxes, hand_boxes,
                 polygon_pts, frame_w, frame_h)
             score_history.append(latest_scores["total"])
 
@@ -800,17 +865,19 @@ def main():
                 max_p_conf = max(p_confs) if p_confs else 0.0
                 max_h_conf = max(h_confs) if h_confs else 0.0
                 ts_str     = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+                is_acc     = 1 if latest_scores['total'] >= SCORE_HI_THRESH else 0
                 csv_writer.writerow([
                     ts_str,
                     f"{latest_scores['total']:.1f}",
                     f"{latest_scores['person_score']:.1f}",
                     f"{latest_scores['hand_score']:.1f}",
-                    f"{latest_scores['motion_score']:.1f}",
+                    f"{latest_scores.get('person_prox', 0.0):.2f}",
+                    f"{latest_scores.get('hand_prox', 0.0):.2f}",
                     len(person_boxes),
                     len(hand_boxes),
                     f"{max_p_conf:.3f}",
                     f"{max_h_conf:.3f}",
-                    motion_area,
+                    is_acc,
                     f"{conf_threshold:.2f}",
                 ])
                 log_handle.flush()
@@ -819,7 +886,6 @@ def main():
             disp = raw_frame.copy()
 
             draw_roi_polygon(disp, polygon_pts, is_roi_drawing, roi_drawing_pts, current_mouse_pos)
-            draw_motion_contours(disp, latest_motion_cnts)
 
             has_roi = bool(polygon_pts and len(polygon_pts) >= 3)
             if has_roi:
@@ -827,32 +893,46 @@ def main():
             else:
                 roi_cx, roi_cy = frame_w // 2, frame_h // 2
 
-            # 1. Person boxes with proximity line & distance indicator (ONLY PERSON)
+            res_scale   = frame_w / 640.0
+            near_zone_p = PERSON_NEAR_ZONE_PX * res_scale
+            near_zone_h = HAND_NEAR_ZONE_PX * res_scale
+
+            # 1. Person boxes with center dot, edge-proximity line & distance indicator
             for x1, y1, x2, y2, conf, cls_id, name in person_boxes:
                 if has_roi:
-                    closest_x = max(x1, min(roi_cx, x2))
-                    closest_y = max(y1, min(roi_cy, y2))
-                    p_dist_px = int(math.hypot(closest_x - roi_cx, closest_y - roi_cy))
-                    dist_tag = "IN ROI" if p_dist_px == 0 else f"d={p_dist_px}px"
+                    pcx = int((x1 + x2) / 2)
+                    pcy = int((y1 + y2) / 2)
+                    p_dist_px, closest_edge_pt = point_to_polygon_edge_dist(
+                        (pcx, pcy), polygon_pts, frame_w, frame_h)
+                    p_dist_int = int(round(p_dist_px))
+                    dist_tag = "IN ROI" if p_dist_int == 0 else ("AT BIN" if p_dist_px <= near_zone_p else f"d={p_dist_int}px")
                     draw_box(disp, x1, y1, x2, y2,
-                             f"Person {conf:.2f}  {dist_tag}", COLOR_PERSON)
-                    if p_dist_px > 0:
-                        cv2.line(disp, (closest_x, closest_y), (roi_cx, roi_cy),
+                             f"Person {conf:.2f}  [{dist_tag}]", COLOR_PERSON)
+                    cv2.circle(disp, (pcx, pcy), 5, COLOR_PERSON, -1)
+                    if p_dist_int > 0:
+                        cv2.circle(disp, closest_edge_pt, 4, COLOR_ROI_EDGE, -1)
+                        cv2.line(disp, (pcx, pcy), closest_edge_pt,
                                  COLOR_PERSON, 1, cv2.LINE_AA)
                 else:
                     draw_box(disp, x1, y1, x2, y2,
                              f"Person {conf:.2f}", COLOR_PERSON)
 
-            # 2. Hand boxes with proximity line & distance indicator (ONLY HAND)
+            # 2. Hand boxes with center dot, edge-proximity line & distance indicator
             for x1, y1, x2, y2, conf in hand_boxes:
-                hcx       = (x1 + x2) // 2
-                hcy       = (y1 + y2) // 2
-                h_dist_px = int(math.hypot(hcx - roi_cx, hcy - roi_cy))
+                hcx = int((x1 + x2) / 2)
+                hcy = int((y1 + y2) / 2)
                 if has_roi:
+                    h_dist_px, closest_edge_pt = point_to_polygon_edge_dist(
+                        (hcx, hcy), polygon_pts, frame_w, frame_h)
+                    h_dist_int = int(round(h_dist_px))
+                    dist_tag = "IN ROI" if h_dist_int == 0 else ("AT BIN" if h_dist_px <= near_zone_h else f"d={h_dist_int}px")
                     draw_box(disp, x1, y1, x2, y2,
-                             f"Hand {conf:.2f}  d={h_dist_px}px", COLOR_HAND)
-                    cv2.line(disp, (hcx, hcy), (roi_cx, roi_cy),
-                             COLOR_HAND, 1, cv2.LINE_AA)
+                             f"Hand {conf:.2f}  [{dist_tag}]", COLOR_HAND)
+                    cv2.circle(disp, (hcx, hcy), 4, COLOR_HAND, -1)
+                    if h_dist_int > 0:
+                        cv2.circle(disp, closest_edge_pt, 3, COLOR_ROI_EDGE, -1)
+                        cv2.line(disp, (hcx, hcy), closest_edge_pt,
+                                 COLOR_HAND, 1, cv2.LINE_AA)
                 else:
                     draw_box(disp, x1, y1, x2, y2,
                              f"Hand {conf:.2f}", COLOR_HAND)
@@ -862,8 +942,10 @@ def main():
             active_alert = alert_msg if time.time() < alert_expiry else ""
             device_hud = "GPU" if DEVICE != "cpu" else "CPU"
             draw_hud(disp, cam_fps, infer_fps, conf_threshold,
-                     len(person_boxes), len(hand_boxes), latest_motion_area,
+                     len(person_boxes), len(hand_boxes),
                      has_roi, is_roi_drawing, active_alert, device_hud)
+            draw_deployment_status(disp, latest_scores, len(person_boxes),
+                                   len(hand_boxes), has_roi)
 
             cv2.imshow(window_name, disp)
 

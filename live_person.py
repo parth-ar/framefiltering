@@ -59,6 +59,10 @@ HAND_MODEL_URL = "https://huggingface.co/Bingsu/adetailer/resolve/main/hand_yolo
 # providing dramatic speedups on CPU while keeping accurate detections.
 INFERENCE_SIZE = 320
 
+# Camera Preview Resolution (720p HD for crisp, high-quality visual preview)
+PREVIEW_WIDTH  = 1280
+PREVIEW_HEIGHT = 720
+
 # Colors for bounding boxes (BGR format)
 HAND_BOX_COLOR = (0, 165, 255)       # High-visibility vibrant orange for hands
 
@@ -164,7 +168,7 @@ def draw_hud(frame, cam_fps, infer_fps, threshold, person_count, hand_count, ale
 
     # Top bar text: Viewfinder FPS, AI FPS, Threshold, Persons, Hands
     stats_text = (
-        f"Cam: {cam_fps:04.1f} FPS  |  AI: {infer_fps:04.1f} FPS  |  "
+        f"Cam: {cam_fps:04.1f} FPS [{width}x{height}]  |  AI: {infer_fps:04.1f} FPS [{INFERENCE_SIZE}p]  |  "
         f"Thresh: {threshold:.2f} (w/s)  |  Persons: {person_count}  |  Hands: {hand_count}"
     )
     cv2.putText(frame, stats_text, (15, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (0, 255, 255), 2, cv2.LINE_AA)
@@ -339,9 +343,9 @@ def main():
         log_handle.close()
         sys.exit(1)
 
-    # Set camera resolution for smooth performance
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+    # Set camera resolution for crisp HD preview (processing remains fast at INFERENCE_SIZE)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH,  PREVIEW_WIDTH)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, PREVIEW_HEIGHT)
 
     # State variables
     conf_threshold = DEFAULT_CONF_THRESHOLD
